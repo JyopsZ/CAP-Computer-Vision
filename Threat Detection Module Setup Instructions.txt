@@ -1,0 +1,40 @@
+-Install Anaconda Prompt (optional but highly recommended) 
+
+(With Anaconda Prompt)
+-Open the Anaconda Prompt Terminal 
+-Create a new Conda Environment: 
+	conda create -n *insert name* python=3.11 -y
+
+(Without)
+-Open any command interface such as cmd in windows
+-make sure that python is installed in the system: 
+	python --version
+
+Installing Dependencies, Using Command Line and pip
+-pip install supabase
+-pip install python-dotenv
+-pip install opencv-python
+
+-Install ffmpeg (already included in folder): 
+	Web download for windows: https://www.gyan.dev/ffmpeg/builds/
+	direct download in Linux: sudo apt install ffmpeg
+
+Run patch on YOLO11 Model
+-git clone https://github.com/ultralytics/ultralytics
+-go to the ultralytics folder inside the project directory
+	cd ultralytics
+-run these 4 commands:
+	git reset --hard 6806f15396432fffb951250d650454b840eb4c28
+	pip install -e .
+	wget https://gist.githubusercontent.com/Y-T-G/8f4fc0b78a0a559a06fe84ae4f359e6e/raw/f8e9ba1644cbfa86295f14fbe26c3d91a504b155/add_head.patch
+	git apply add_head.patch
+
+
+Running The Program
+-activate conda environment (skip if using default OS CLI)
+	conda activate *chosen name*
+-enter folder of detectionModule.py
+	cd anomaly
+-run the python script
+	python detectionModule.py
+	
