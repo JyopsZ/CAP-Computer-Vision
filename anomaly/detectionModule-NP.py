@@ -56,6 +56,18 @@ box_thickness, font_thickness = 4, 2
 #cap = cv2.VideoCapture("../Test Videos/ytRoad1.mp4") # accident road - crash road
 #cap = cv2.VideoCapture("http://114.179.127.11:8010/mjpg/video.mjpg") # live insecam
 
+# ------------ STREAM APPEARANCE -------------
+SCREEN_W, SCREEN_H = 1920, 1080
+QUAD_W, QUAD_H = SCREEN_W // 2, SCREEN_H // 2
+
+# Quadrant positions
+positions = [
+    (0, 0),                
+    (QUAD_W, 0),           
+    (0, QUAD_H),           
+    (QUAD_W, QUAD_H)       
+]
+
 # ------------ MULTI STREAM -------------
 shared_frames = {}
 frame_lock = threading.Lock()
@@ -636,18 +648,21 @@ for cam in cctvs.data:
         target=run_stream,
         args=(cam["cctv_id"], cam["cctv_url"], cam["cctv_location"])
     )
+    t.daemon = True  # threads die when main thread exits
     t.start()
     threads.append(t)
 
-for t in threads:
-    t.join()
-
-
 while True:
     with frame_lock:
-        for cam_id, frame in shared_frames.items():
+        for idx, (cam_id, frame) in enumerate(shared_frames.items()):
+            if idx >= 4:
+                break
+            resized = cv2.resize(frame, (QUAD_W, QUAD_H))
             window_name = f"CCTV {cam_id}"
-            cv2.imshow(window_name, frame)
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, QUAD_W, QUAD_H)
+            cv2.moveWindow(window_name, positions[idx][0], positions[idx][1])
+            cv2.imshow(window_name, resized)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
