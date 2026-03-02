@@ -306,13 +306,6 @@ while True:
         # Current speed
         pts = person_traj.get(track_id, vehicle_traj.get(track_id, []))
         current_speed[track_id] = pixel_speed(pts[-2], pts[-1]) if len(pts) >= 2 else 0.0
-
-    # ---------------- REST OF YOUR HUMAN & VEHICLE EVENT LOGIC ----------------
-    # Everything from Rider detection, Human Event Detection, Vehicle Event Detection,
-    # video recording, Supabase upload, etc. remains unchanged.
-
-    # For brevity, I'm keeping the same logic as in your original code.
-
     
     # ------------ Rider -------------
     RIDER_IOU = 0.8 # overlap threshold for a person and vehicle pair to be evaluated as a rider
@@ -458,11 +451,20 @@ while True:
 
     # ------------ Vehicle Event detection -------------
     #THRESHOLDS
-    ROAD_SPEED_DROP = 14.0     # sudden decel 
-    ROAD_IOU = 0.3           # overlap for impact
-    MIN_MOVING_SPEED = 6.0    # require movement
+
     MIN_TRACKING = 5          # must be tracked for N frames
+    ROAD_LOCK_FRAMES = 12     # lock accident box
     SMOOTH_FRAMES = 3         # median smoothing window
+
+    # regular vehicle thresholds
+    NORMAL_SPEED_DROP = 14.0
+    NORMAL_MIN_SPEED = 6.0
+    NORMAL_IOU = 0.3
+
+    # small vehicles (motorcycle, tricycle, bicycle)
+    SMALL_SPEED_DROP = 18.0
+    SMALL_MIN_SPEED = 10.0
+    SMALL_IOU = 0.4
 
     vehicle_speed_hist = road_state.setdefault("speed_hist", {})
 
@@ -470,49 +472,66 @@ while True:
         if len(traj) < MIN_TRACKING:
             continue
 
-        v_raw = current_speed.get(vid, 0)
+        cls_id = None
+    # get class id for this tracked vehicle
+    for box in r.boxes:
+        if int(box.id[0]) == vid:
+            cls_id = int(box.cls[0])
+            break
 
-        # --- median smoothing for stability ---
-        hist = vehicle_speed_hist.setdefault(vid, [])
-        hist.append(v_raw)
-        if len(hist) > SMOOTH_FRAMES:
-            hist.pop(0)
-        v_now = sorted(hist)[len(hist)//2]  # median = less jittery
+    v_raw = current_speed.get(vid, 0)
 
-        v_prev = speed_history.get(vid, v_now)
-        speed_history[vid] = v_now
+    # --- class-specific thresholds ---
+    if cls_id in [1, 3, 81]:  # bicycle, motorcycle, tricycle
+        MIN_SPEED = SMALL_MIN_SPEED
+        SPEED_DROP = SMALL_SPEED_DROP
+        ROAD_IOU_CLASS = SMALL_IOU
+    else:
+        MIN_SPEED = NORMAL_MIN_SPEED
+        SPEED_DROP = NORMAL_SPEED_DROP
+        ROAD_IOU_CLASS = NORMAL_IOU
 
-        # ignore tiny jitter drops
-        if abs(v_prev - v_now) < 2.5:
+    # --- median smoothing (optional) ---
+    hist = vehicle_speed_hist.setdefault(vid, [])
+    hist.append(v_raw)
+    if len(hist) > SMOOTH_FRAMES:
+        hist.pop(0)
+    v_now = sorted(hist)[len(hist)//2]  # median
+
+    v_prev = speed_history.get(vid, v_now)
+    speed_history[vid] = v_now
+
+    # ignore tiny jitter drops
+    if abs(v_prev - v_now) < 2.5:
+        continue
+
+    # only consider moving vehicles
+    if v_prev > MIN_SPEED and (v_prev - v_now > SPEED_DROP):
+        vbox = bbox_history.get(vid)
+        if not vbox:
             continue
 
-        # only consider moving vehicles
-        if v_prev > MIN_MOVING_SPEED and (v_prev - v_now > ROAD_SPEED_DROP):
-            vbox = bbox_history.get(vid)
-            if not vbox:
+        accident = False
+
+        #--- vehicle vs vehicle ---
+        for vid2, vbox2 in bbox_history.items():
+            if vid2 == vid:
                 continue
+            if iou(vbox, vbox2) > ROAD_IOU_CLASS:
+                accident = True
+                # merge boxes
+                x1 = min(vbox[0], vbox2[0])
+                y1 = min(vbox[1], vbox2[1])
+                x2 = max(vbox[2], vbox2[2])
+                y2 = max(vbox[3], vbox2[3])
+                road_locked_bbox = (x1, y1, x2, y2)
+                break
 
-            accident = False
+        #--- single vehicle event ---
+        if not accident:
+            road_locked_bbox = vbox
 
-            #--- vehicle vehicle ---
-            for vid2, vbox2 in bbox_history.items():
-                if vid2 == vid:
-                    continue
-                if iou(vbox, vbox2) > ROAD_IOU:
-                    accident = True
-                    # merge both boxes
-                    x1 = min(vbox[0], vbox2[0])
-                    y1 = min(vbox[1], vbox2[1])
-                    x2 = max(vbox[2], vbox2[2])
-                    y2 = max(vbox[3], vbox2[3])
-                    road_locked_bbox = (x1, y1, x2, y2)
-                    break
-
-            #--- vehicle to others ---
-            if not accident:
-                road_locked_bbox = vbox
-
-            road_lock_counter = ROAD_LOCK_FRAMES
+        road_lock_counter = ROAD_LOCK_FRAMES
 
     # --- Draw accident alert ---
     if road_lock_counter > 0 and road_locked_bbox is not None:
