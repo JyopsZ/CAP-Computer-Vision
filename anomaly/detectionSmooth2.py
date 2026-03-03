@@ -1,4 +1,4 @@
-# Event Detection System V1.14.2
+# Event Detection System V2.0.2
 # If using conda, don't forget to activate environment
 # download FFMPEG, broswer on windows, set env path - cmd on linux
 
@@ -13,7 +13,7 @@ import time
 import subprocess
 import threading
 import supervision as sv
-import re
+from collections import deque
 #import atexit
 # FFMPEG DOWNLOAD: https://www.gyan.dev/ffmpeg/builds/
 
@@ -452,86 +452,136 @@ while True:
     # ------------ Vehicle Event detection -------------
     #THRESHOLDS
 
-    MIN_TRACKING = 5          # must be tracked for N frames
+    MIN_TRACKING = 5         # must be tracked for N frames
     ROAD_LOCK_FRAMES = 12     # lock accident box
     SMOOTH_FRAMES = 3         # median smoothing window
 
     # regular vehicle thresholds
-    NORMAL_SPEED_DROP = 14.0
-    NORMAL_MIN_SPEED = 6.0
-    NORMAL_IOU = 0.3
+    NORMAL_SPEED_DROP = 12.0
+    NORMAL_MIN_SPEED  = 6.0
+    NORMAL_IOU        = 0.2
 
     # small vehicles (motorcycle, tricycle, bicycle)
-    SMALL_SPEED_DROP = 18.0
+    SMALL_SPEED_DROP = 20.0
     SMALL_MIN_SPEED = 10.0
-    SMALL_IOU = 0.4
+    SMALL_IOU = 0.3
+
+    SMALL_IDS  = {1, 3, 81}       # bicycle, motorcycle, tricycle
+    NORMAL_IDS = {2, 5, 7, 80}    # car, bus, truck, jeepney
+
+    vehicle_classes = {
+        int(box.id[0]): int(box.cls[0])
+        for box in r.boxes
+        if box.id is not None and int(box.cls[0]) in vehicle_ids + [1]  # include bicycle for rider logic
+    }
+
+    # vehicles that currently have riders (pid, vid) pairs
+    vehicles_with_riders = {vid for (_, vid) in riding_vehicle}
 
     vehicle_speed_hist = road_state.setdefault("speed_hist", {})
+    vehicle_prev_area  = road_state.setdefault("prev_area", {})   # jitter guard
 
     for vid, traj in vehicle_traj.items():
         if len(traj) < MIN_TRACKING:
             continue
 
-        cls_id = None
-    # get class id for this tracked vehicle
-    for box in r.boxes:
-        if int(box.id[0]) == vid:
-            cls_id = int(box.cls[0])
-            break
+        cls_id = vehicle_classes.get(vid)
+        if cls_id is None:
+            continue
 
-    v_raw = current_speed.get(vid, 0)
 
-    # --- class-specific thresholds ---
-    if cls_id in [1, 3, 81]:  # bicycle, motorcycle, tricycle
-        MIN_SPEED = SMALL_MIN_SPEED
-        SPEED_DROP = SMALL_SPEED_DROP
-        ROAD_IOU_CLASS = SMALL_IOU
-    else:
-        MIN_SPEED = NORMAL_MIN_SPEED
-        SPEED_DROP = NORMAL_SPEED_DROP
-        ROAD_IOU_CLASS = NORMAL_IOU
+        # motorcycle and person filter
+        if cls_id in SMALL_IDS and vid in vehicles_with_riders:
+            continue
 
-    # --- median smoothing (optional) ---
-    hist = vehicle_speed_hist.setdefault(vid, [])
-    hist.append(v_raw)
-    if len(hist) > SMOOTH_FRAMES:
-        hist.pop(0)
-    v_now = sorted(hist)[len(hist)//2]  # median
+        v_raw = current_speed.get(vid, 0.0)
 
-    v_prev = speed_history.get(vid, v_now)
-    speed_history[vid] = v_now
+        # ---------- class thresholds ----------
+        if cls_id in SMALL_IDS:
+            MIN_MOVING_SPEED = SMALL_MIN_SPEED
+            ROAD_SPEED_DROP  = SMALL_SPEED_DROP
+            ROAD_IOU         = SMALL_IOU
+        else:
+            MIN_MOVING_SPEED = NORMAL_MIN_SPEED
+            ROAD_SPEED_DROP  = NORMAL_SPEED_DROP
+            ROAD_IOU         = NORMAL_IOU
 
-    # ignore tiny jitter drops
-    if abs(v_prev - v_now) < 2.5:
-        continue
+        # ---------- median smoothing ----------
+        hist = vehicle_speed_hist.setdefault(vid, [])
+        hist.append(v_raw)
+        if len(hist) > SMOOTH_FRAMES:
+            hist.pop(0)
+        v_now = sorted(hist)[len(hist)//2]
 
-    # only consider moving vehicles
-    if v_prev > MIN_SPEED and (v_prev - v_now > SPEED_DROP):
+        v_prev = speed_history.get(vid, v_now)
+        speed_history[vid] = v_now
+
+        # ignore tiny jitter drops
+        if abs(v_prev - v_now) < 2.5:
+            continue
+
+        # ---------- sudden drop gate ----------
+        if not (v_prev > MIN_MOVING_SPEED and (v_prev - v_now > ROAD_SPEED_DROP)):
+            continue
+
         vbox = bbox_history.get(vid)
         if not vbox:
             continue
 
+        # ---------- bbox area jump filter (kills track jitter false spikes) ----------
+        curr_area = (vbox[2] - vbox[0]) * (vbox[3] - vbox[1])
+        prev_area = vehicle_prev_area.get(vid, curr_area)
+        if prev_area <= 0:
+            prev_area = curr_area
+
+        area_ratio = curr_area / prev_area
+        vehicle_prev_area[vid] = curr_area
+
+        # if the box suddenly explodes/shrinks, that's usually tracking jitter → skip
+        if area_ratio > 2.5 or area_ratio < 0.4:
+            continue
+
         accident = False
 
-        #--- vehicle vs vehicle ---
+        # ---------- vehicle vs vehicle ----------
         for vid2, vbox2 in bbox_history.items():
             if vid2 == vid:
                 continue
-            if iou(vbox, vbox2) > ROAD_IOU_CLASS:
+
+            cls2 = vehicle_classes.get(vid2)
+            if cls2 is None:
+                continue
+
+            # Optional: skip small-small collisions (massive false-positive reducer)
+            if (cls_id in SMALL_IDS) and (cls2 in SMALL_IDS):
+                continue
+
+            if iou(vbox, vbox2) > ROAD_IOU:
                 accident = True
-                # merge boxes
                 x1 = min(vbox[0], vbox2[0])
                 y1 = min(vbox[1], vbox2[1])
                 x2 = max(vbox[2], vbox2[2])
                 y2 = max(vbox[3], vbox2[3])
                 road_locked_bbox = (x1, y1, x2, y2)
                 break
-
-        #--- single vehicle event ---
+        
         if not accident:
-            road_locked_bbox = vbox
+            if area_ratio < 0.6 and (v_prev - v_now > ROAD_SPEED_DROP * 0.8):
+                road_locked_bbox = vbox
+                road_lock_counter = ROAD_LOCK_FRAMES
+                continue
 
-        road_lock_counter = ROAD_LOCK_FRAMES
+        # ---------- single vehicle crash fallback ----------
+        # IMPORTANT: allow single-vehicle crash only for NORMAL vehicles
+        if not accident:
+            if cls_id in NORMAL_IDS:
+                road_locked_bbox = vbox
+                road_lock_counter = ROAD_LOCK_FRAMES
+            else:
+                # prevent false positive
+                continue
+        else:
+            road_lock_counter = ROAD_LOCK_FRAMES
 
     # --- Draw accident alert ---
     if road_lock_counter > 0 and road_locked_bbox is not None:

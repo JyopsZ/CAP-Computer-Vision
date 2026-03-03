@@ -113,6 +113,11 @@ tracker = sv.ByteTrack(frame_rate=VID_FPS) # smoothing # CAPIT02
 smoother = sv.DetectionsSmoother()
 bounding_box_annotator = sv.RoundBoxAnnotator() 
 
+# ------------ VEHICLE METRICS CSV (DEBUG) -------------
+DEBUG_VEHICLE_CSV = os.path.join(SAVE_PATH, "vehicle_metrics.csv")
+DEBUG_LOG_EVERY_SEC = 0.5  # set 0.0 to log every frame (can get huge)
+_veh_dbg_last_ts = 0.0
+
 csv_log = os.path.join(SAVE_PATH, "incident_log.csv")
 if not os.path.exists(csv_log):
     with open(csv_log, "w", newline="") as f:
@@ -449,89 +454,203 @@ while True:
 
 
 
-    # ------------ Vehicle Event detection -------------
-    #THRESHOLDS
+# ------------ Vehicle Metrics Logging (CSV ONLY) -------------
 
-    MIN_TRACKING = 5          # must be tracked for N frames
-    ROAD_LOCK_FRAMES = 12     # lock accident box
-    SMOOTH_FRAMES = 3         # median smoothing window
+    MIN_TRACKING = 5
+    SMOOTH_FRAMES = 3
 
-    # regular vehicle thresholds
-    NORMAL_SPEED_DROP = 14.0
-    NORMAL_MIN_SPEED = 6.0
-    NORMAL_IOU = 0.3
+    # thresholds (still logged so you can see if they would pass)
+    NORMAL_SPEED_DROP = 10.0
+    NORMAL_MIN_SPEED  = 6.0
+    NORMAL_IOU        = 0.25
 
-    # small vehicles (motorcycle, tricycle, bicycle)
-    SMALL_SPEED_DROP = 18.0
-    SMALL_MIN_SPEED = 10.0
-    SMALL_IOU = 0.4
+    SMALL_SPEED_DROP = 20.0
+    SMALL_MIN_SPEED  = 10.0
+    SMALL_IOU        = 0.45
+
+    SMALL_IDS  = {1, 3, 81}       # bicycle, motorcycle, tricycle
+    NORMAL_IDS = {2, 5, 7, 80}    # car, bus, truck, jeepney
+
+    # ---------- frame-level ID capture ----------
+    frame_all_ids = []
+    frame_vehicle_ids = []
+    frame_person_ids = []
+    frame_ids_by_class = {}  # cls_id -> [ids]
+
+    for box in r.boxes:
+        if box.id is None:
+            continue
+        tid = int(box.id[0])
+        cid = int(box.cls[0])
+
+        frame_all_ids.append(tid)
+        frame_ids_by_class.setdefault(cid, []).append(tid)
+
+        if cid == 0:
+            frame_person_ids.append(tid)
+        if cid in (vehicle_ids + [1]):  # include bicycle=1 if you want
+            frame_vehicle_ids.append(tid)
+
+    # compact string versions for CSV
+    frame_all_ids_str = ",".join(map(str, sorted(set(frame_all_ids))))
+    frame_vehicle_ids_str = ",".join(map(str, sorted(set(frame_vehicle_ids))))
+    frame_person_ids_str = ",".join(map(str, sorted(set(frame_person_ids))))
+
+    # e.g. "0:[1,2]|2:[10]|3:[7,8]"
+    frame_ids_by_class_str = "|".join(
+        f"{cid}:[{','.join(map(str, sorted(set(ids_))))}]"
+        for cid, ids_ in sorted(frame_ids_by_class.items(), key=lambda x: x[0])
+    )
+
+    # map: track_id -> class_id for current frame
+    vehicle_classes = {
+        int(box.id[0]): int(box.cls[0])
+        for box in r.boxes
+        if box.id is not None and int(box.cls[0]) in (vehicle_ids + [1])
+    }
+
+    vehicles_with_riders = {vid for (_, vid) in riding_vehicle}
 
     vehicle_speed_hist = road_state.setdefault("speed_hist", {})
+    vehicle_prev_area  = road_state.setdefault("prev_area", {})
 
-    for vid, traj in vehicle_traj.items():
-        if len(traj) < MIN_TRACKING:
-            continue
+    # throttle logging
+    now_ts = time.time()
+    do_log = (DEBUG_LOG_EVERY_SEC == 0.0) or ((now_ts - _veh_dbg_last_ts) >= DEBUG_LOG_EVERY_SEC)
+    if do_log:
+        _veh_dbg_last_ts = now_ts
 
-        cls_id = None
-    # get class id for this tracked vehicle
-    for box in r.boxes:
-        if int(box.id[0]) == vid:
-            cls_id = int(box.cls[0])
-            break
+        # write header once
+        if not os.path.exists(DEBUG_VEHICLE_CSV) or os.path.getsize(DEBUG_VEHICLE_CSV) == 0:
+            with open(DEBUG_VEHICLE_CSV, "w", newline="") as f:
+                csv.writer(f).writerow([
+                    # frame-level ids
+                    "ts_iso","frame_ts",
+                    "frame_all_ids","frame_vehicle_ids","frame_person_ids","frame_ids_by_class",
 
-    v_raw = current_speed.get(vid, 0)
+                    # per-vehicle row data
+                    "vid","cls_id","class_type","has_rider","traj_len",
+                    "v_raw","v_prev","v_now","dv",
+                    "min_moving","speed_drop_thr",
+                    "iou_thr",
+                    "bbox_x1","bbox_y1","bbox_x2","bbox_y2",
+                    "curr_area","prev_area","area_ratio",
+                    "best_iou","best_other_vid","best_other_cls",
+                    "gate_min_tracking","gate_rider_skip","gate_bbox_present",
+                    "gate_jitter_ignore","gate_sudden_drop","gate_area_ok"
+                ])
 
-    # --- class-specific thresholds ---
-    if cls_id in [1, 3, 81]:  # bicycle, motorcycle, tricycle
-        MIN_SPEED = SMALL_MIN_SPEED
-        SPEED_DROP = SMALL_SPEED_DROP
-        ROAD_IOU_CLASS = SMALL_IOU
-    else:
-        MIN_SPEED = NORMAL_MIN_SPEED
-        SPEED_DROP = NORMAL_SPEED_DROP
-        ROAD_IOU_CLASS = NORMAL_IOU
+        rows = []
 
-    # --- median smoothing (optional) ---
-    hist = vehicle_speed_hist.setdefault(vid, [])
-    hist.append(v_raw)
-    if len(hist) > SMOOTH_FRAMES:
-        hist.pop(0)
-    v_now = sorted(hist)[len(hist)//2]  # median
+        for vid, traj in vehicle_traj.items():
+            traj_len = len(traj)
+            gate_min_tracking = traj_len >= MIN_TRACKING
 
-    v_prev = speed_history.get(vid, v_now)
-    speed_history[vid] = v_now
+            cls_id = vehicle_classes.get(vid)
+            if cls_id is None:
+                rows.append([
+                    datetime.now(ph_tz).isoformat(), now_ts,
+                    frame_all_ids_str, frame_vehicle_ids_str, frame_person_ids_str, frame_ids_by_class_str,
 
-    # ignore tiny jitter drops
-    if abs(v_prev - v_now) < 2.5:
-        continue
-
-    # only consider moving vehicles
-    if v_prev > MIN_SPEED and (v_prev - v_now > SPEED_DROP):
-        vbox = bbox_history.get(vid)
-        if not vbox:
-            continue
-
-        accident = False
-
-        #--- vehicle vs vehicle ---
-        for vid2, vbox2 in bbox_history.items():
-            if vid2 == vid:
+                    vid, None, None, None, traj_len,
+                    None, None, None, None,
+                    None, None,
+                    None,
+                    None, None, None, None,
+                    None, None, None,
+                    None, None, None,
+                    int(gate_min_tracking), None, 0,
+                    None, None, None
+                ])
                 continue
-            if iou(vbox, vbox2) > ROAD_IOU_CLASS:
-                accident = True
-                # merge boxes
-                x1 = min(vbox[0], vbox2[0])
-                y1 = min(vbox[1], vbox2[1])
-                x2 = max(vbox[2], vbox2[2])
-                y2 = max(vbox[3], vbox2[3])
-                road_locked_bbox = (x1, y1, x2, y2)
-                break
 
-        #--- single vehicle event ---
-        if not accident:
-            road_locked_bbox = vbox
+            is_small = cls_id in SMALL_IDS
+            class_type = "small" if is_small else "normal"
+            has_rider = int(vid in vehicles_with_riders)
 
-        road_lock_counter = ROAD_LOCK_FRAMES
+            gate_rider_skip = not (is_small and (vid in vehicles_with_riders))
+
+            # thresholds for logging
+            if is_small:
+                MIN_MOVING_SPEED = SMALL_MIN_SPEED
+                SPEED_DROP = SMALL_SPEED_DROP
+                IOU_THR = SMALL_IOU
+            else:
+                MIN_MOVING_SPEED = NORMAL_MIN_SPEED
+                SPEED_DROP = NORMAL_SPEED_DROP
+                IOU_THR = NORMAL_IOU
+
+            v_raw = float(current_speed.get(vid, 0.0))
+
+            # smoothing
+            hist = vehicle_speed_hist.setdefault(vid, [])
+            hist.append(v_raw)
+            if len(hist) > SMOOTH_FRAMES:
+                hist.pop(0)
+            v_now = float(sorted(hist)[len(hist)//2])
+
+            v_prev = float(speed_history.get(vid, v_now))
+            speed_history[vid] = v_now
+            dv = v_prev - v_now
+
+            gate_jitter_ignore = not (abs(dv) < 2.5)
+            gate_sudden_drop = (v_prev > MIN_MOVING_SPEED and dv > SPEED_DROP)
+
+            vbox = bbox_history.get(vid)
+            gate_bbox_present = int(vbox is not None)
+
+            # area filter
+            if vbox is not None:
+                curr_area = (vbox[2] - vbox[0]) * (vbox[3] - vbox[1])
+                prev_area = vehicle_prev_area.get(vid, curr_area) or curr_area
+                area_ratio = (curr_area / prev_area) if prev_area > 0 else 1.0
+                vehicle_prev_area[vid] = curr_area
+                gate_area_ok = int(0.4 <= area_ratio <= 2.5)
+                x1, y1, x2, y2 = vbox
+            else:
+                curr_area = prev_area = area_ratio = None
+                gate_area_ok = 0
+                x1 = y1 = x2 = y2 = None
+
+            # best IOU in this frame
+            best_iou = 0.0
+            best_other_vid = None
+            best_other_cls = None
+
+            if vbox is not None:
+                for vid2, vbox2 in bbox_history.items():
+                    if vid2 == vid:
+                        continue
+                    cls2 = vehicle_classes.get(vid2)
+                    if cls2 is None:
+                        continue
+                    if (cls_id in SMALL_IDS) and (cls2 in SMALL_IDS):
+                        continue
+
+                    iou_val = iou(vbox, vbox2)
+                    if iou_val > best_iou:
+                        best_iou = iou_val
+                        best_other_vid = vid2
+                        best_other_cls = cls2
+
+            rows.append([
+                datetime.now(ph_tz).isoformat(), now_ts,
+                frame_all_ids_str, frame_vehicle_ids_str, frame_person_ids_str, frame_ids_by_class_str,
+
+                vid, cls_id, class_type, has_rider, traj_len,
+                v_raw, v_prev, v_now, dv,
+                MIN_MOVING_SPEED, SPEED_DROP,
+                IOU_THR,
+                x1, y1, x2, y2,
+                curr_area, prev_area, area_ratio,
+                best_iou, best_other_vid, best_other_cls,
+                int(gate_min_tracking), int(gate_rider_skip), gate_bbox_present,
+                int(gate_jitter_ignore), int(gate_sudden_drop), int(gate_area_ok)
+            ])
+
+        if rows:
+            with open(DEBUG_VEHICLE_CSV, "a", newline="") as f:
+                csv.writer(f).writerows(rows)
 
     # --- Draw accident alert ---
     if road_lock_counter > 0 and road_locked_bbox is not None:
