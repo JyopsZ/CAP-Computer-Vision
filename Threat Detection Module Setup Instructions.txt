@@ -14,6 +14,7 @@ Installing Dependencies, Using Command Line and pip
 -pip install supabase
 -pip install python-dotenv
 -pip install opencv-python
+-pip install supervision
 
 -Install ffmpeg (already included in folder): 
 	Web download for windows: https://www.gyan.dev/ffmpeg/builds/
