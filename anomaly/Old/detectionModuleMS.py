@@ -1,4 +1,4 @@
-# Event Detection System V1.14.2
+# Event Detection System V1.15.0 - Multi Stream Version
 # If using conda, don't forget to activate environment
 # download FFMPEG, broswer on windows, set env path - cmd on linux
 
