@@ -190,7 +190,7 @@ def event_database_async(event_type, location, filename, cctv_id):
 
 def event_database_handling(event_type, location, filename, cctv_id):
     try:
-        ts = datetime.now().isoformat()
+        ts = datetime.now(timezone.utc).isoformat()
         print(f"[DB] Creating threat_detection record for {event_type}...")
         threat_detection = {
             "incident_type": event_type,
